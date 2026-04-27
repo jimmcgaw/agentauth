@@ -1,0 +1,261 @@
+# Local development stack for the AI Agent AuthN/AuthZ platform.
+#
+# Brings up:
+#   - SPIRE Server         (identity authority)
+#   - SPIRE Agent          (per-node Workload API)
+#   - OPA                  (policy decision point)
+#   - OPAL Server          (policy distribution control plane)
+#   - OPAL Client          (sidecar that pushes updates from OPAL -> OPA)
+#
+# This stack is dev-only. Per CLAUDE.md it MUST NOT be promoted to staging
+# or production as-is: it uses the join_token attestor, insecure_bootstrap
+# on the agent, and disables OPAL authentication.
+#
+# Bootstrap flow (one-time per `compose up`):
+#
+#   1. docker compose up -d spire-server opa opal-server opal-client
+#        - opal-policy-repo-init runs first, syncs policies/ into a clean
+#          Git repo inside the `opal-policy-repo` volume, then exits.
+#        - opal-server reads from that volume; OPA, OPAL Server, and OPAL
+#          Client come up.
+#   2. ../scripts/register-test-agent.sh
+#        - waits for the SPIRE Server to be healthy
+#        - generates a join token
+#        - registers the dev test-agent workload entry
+#        - writes the token into the spire-bootstrap volume
+#   3. docker compose up -d spire-agent
+#        - reads the token from the spire-bootstrap volume
+#
+# Re-syncing policies during dev:
+#
+#   docker compose up -d --force-recreate opal-policy-repo-init
+#
+# (OPAL Server picks up the new commit on its next poll cycle.)
+
+name: agentauth-dev
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  # SPIRE Server's admin/private socket and SQLite datastore. Shared with
+  # any tool that needs to call the Server's local API (e.g., the
+  # register-test-agent.sh script when it execs into the server container).
+  spire-server-private:
+  spire-server-data:
+
+  # The Workload API socket. Bind-mounted into the SPIRE Agent and into
+  # every workload container that needs to fetch SVIDs.
+  spire-agent-socket:
+
+  # SPIRE Agent's local KeyManager / cache state.
+  spire-agent-data:
+
+  # The bootstrap directory where the join token is written for the agent
+  # to consume. Populated by scripts/register-test-agent.sh.
+  spire-bootstrap:
+
+  # A dedicated, clean Git repo that OPAL Server clones from. Populated by
+  # the `opal-policy-repo-init` service before OPAL starts. We use a fresh
+  # repo inside a named volume (rather than bind-mounting the workspace
+  # `.git`) so OPAL is decoupled from host file ownership / git
+  # safe.directory issues, and the dev loop matches production semantics
+  # where OPAL points at a remote Git URL.
+  opal-policy-repo:
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+services:
+
+  # -------------------------------------------------------------------------
+  # SPIRE Server — identity authority
+  # -------------------------------------------------------------------------
+  spire-server:
+    image: ghcr.io/spiffe/spire-server:1.9.6
+    container_name: agentauth-spire-server
+    command:
+      - -config
+      - /run/spire/config/server.conf
+    volumes:
+      - ../spire/server/server.conf:/run/spire/config/server.conf:ro
+      - spire-server-private:/tmp/spire-server/private
+      - spire-server-data:/run/spire/server/data
+      - spire-bootstrap:/run/spire/bootstrap
+    ports:
+      # Expose the Server's gRPC API on the host for `spire-server` CLI
+      # invocations from helper scripts.
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-server", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # SPIRE Agent — per-node Workload API
+  # -------------------------------------------------------------------------
+  # Started AFTER the bootstrap script has written a join token into the
+  # spire-bootstrap volume. The agent's entrypoint reads that file at
+  # startup and passes it to `spire-agent run -joinToken ...`.
+  spire-agent:
+    image: ghcr.io/spiffe/spire-agent:1.9.6
+    container_name: agentauth-spire-agent
+    depends_on:
+      spire-server:
+        condition: service_healthy
+    # The agent needs root to bind the Workload API UDS at the shared path
+    # and to attest workloads via the unix attestor.
+    user: "0:0"
+    pid: host
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        if [ ! -s /run/spire/bootstrap/join_token ]; then
+          echo "[spire-agent] ERROR: /run/spire/bootstrap/join_token is missing or empty."
+          echo "[spire-agent] Run scripts/register-test-agent.sh first to generate one."
+          exit 1
+        fi
+        exec /opt/spire/bin/spire-agent run \
+          -config /run/spire/config/agent.conf \
+          -joinToken "$$(cat /run/spire/bootstrap/join_token)"
+    volumes:
+      - ../spire/agent/agent.conf:/run/spire/config/agent.conf:ro
+      - spire-bootstrap:/run/spire/bootstrap:ro
+      - spire-agent-socket:/run/spire/agent/sock
+      - spire-agent-data:/run/spire/agent/data
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-agent", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # OPA — policy decision point
+  # -------------------------------------------------------------------------
+  opa:
+    image: openpolicyagent/opa:0.65.0
+    container_name: agentauth-opa
+    command:
+      - run
+      - --server
+      - --addr=0.0.0.0:8181
+      - --diagnostic-addr=0.0.0.0:8282
+      - --log-level=info
+      - --log-format=json
+      - --config-file=/config/opa-config.yaml
+      # Bind-mount the policies/ tree so OPA has a working set even before
+      # OPAL pushes updates. OPAL will overwrite this view at runtime.
+      - /policies
+    volumes:
+      - ../opal/opa-config.yaml:/config/opa-config.yaml:ro
+      - ../policies:/policies:ro
+    ports:
+      - "127.0.0.1:8181:8181"
+      - "127.0.0.1:8282:8282"
+    healthcheck:
+      test: ["CMD", "/opa", "version"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # OPAL policy repo init — builds a clean Git repo from policies/
+  # -------------------------------------------------------------------------
+  # Runs once per `compose up`, exits 0, and lets OPAL Server start. Each
+  # subsequent run re-syncs the host's policies/ tree into the volume and
+  # creates a new commit if anything changed; OPAL Server polls the repo
+  # and picks up the new commit via its normal pull cycle.
+  opal-policy-repo-init:
+    image: alpine/git:2.43.0
+    container_name: agentauth-opal-policy-init
+    user: "0:0"
+    volumes:
+      - ../policies:/src/policies:ro
+      - opal-policy-repo:/repo
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        cd /repo
+        if [ ! -d .git ]; then
+          echo "[opal-policy-init] initializing /repo as a fresh git repo"
+          git init -q -b main
+        fi
+        git config user.email "opal-init@agentauth.local"
+        git config user.name  "opal-init"
+        git config --add safe.directory /repo
+        mkdir -p /repo/policies
+        # Mirror the workspace policies/ tree into the volume. --delete
+        # ensures removed files on the host are removed in the volume too.
+        # Using cp because Alpine's busybox lacks rsync by default; we
+        # clear the target subtree first to get delete semantics.
+        rm -rf /repo/policies
+        mkdir -p /repo/policies
+        cp -R /src/policies/. /repo/policies/
+        chmod -R a+rX /repo
+        git add -A
+        if git diff --cached --quiet; then
+          echo "[opal-policy-init] no changes to commit (HEAD: $$(git rev-parse --short HEAD 2>/dev/null || echo none))"
+        else
+          git commit -q -m "sync policies from workspace ($$(date -u +%FT%TZ))"
+          echo "[opal-policy-init] new commit: $$(git rev-parse --short HEAD)"
+        fi
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # OPAL Server — watches the dedicated policies repo, pushes to clients
+  # -------------------------------------------------------------------------
+  opal-server:
+    image: permitio/opal-server:0.7.11
+    container_name: agentauth-opal-server
+    depends_on:
+      opal-policy-repo-init:
+        condition: service_completed_successfully
+    env_file:
+      - ../opal/opal-server.env
+    # Defense-in-depth: tell git inside the container to trust /opal/repo
+    # regardless of UID ownership. The init container also chmods the
+    # tree a+rX, so OPAL's non-root user can read it.
+    environment:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: "safe.directory"
+      GIT_CONFIG_VALUE_0: "*"
+    volumes:
+      - opal-policy-repo:/opal/repo:ro
+    ports:
+      - "127.0.0.1:7002:7002"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7002/healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # OPAL Client — sidecar that applies updates to OPA
+  # -------------------------------------------------------------------------
+  opal-client:
+    image: permitio/opal-client:0.7.11
+    container_name: agentauth-opal-client
+    depends_on:
+      opa:
+        condition: service_started
+      opal-server:
+        condition: service_healthy
+    env_file:
+      - ../opal/opal-client.env
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7000/healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped

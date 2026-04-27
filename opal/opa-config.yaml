@@ -1,0 +1,22 @@
+# OPA configuration for the local development stack.
+#
+# Decision logging is enabled and pushed to the audit-collector service
+# (or to the console, in this dev stack until the audit-collector lands in
+# Phase 4a). Policies and data are pushed to OPA by the OPAL Client over
+# its REST API, so OPA itself does not load bundles from a remote source.
+#
+# Production OPA configuration will live in deploy/k8s/ and have additional
+# settings (mTLS for inbound queries, persistent decision-log shipping, etc.).
+
+decision_logs:
+  console: true
+  reporting:
+    min_delay_seconds: 5
+    max_delay_seconds: 10
+
+status:
+  console: true
+
+# No `services:` and no `bundles:` here — OPAL Client pushes policy and data
+# to OPA via OPA's local REST API, which is exposed on 0.0.0.0:8181 by
+# default in the OPA container.

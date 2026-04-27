@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Workflow-level permissions: read-only by default. Individual jobs that
+# need to write (none currently) must opt in explicitly.
+permissions:
+  contents: read
+
+# Cancel in-progress runs on the same ref when a new commit is pushed.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Pinned tool versions. Bumping these is a deliberate change.
+env:
+  OPA_VERSION: "0.65.0"
+  REGAL_VERSION: "0.24.0"
+  SPIRE_VERSION: "1.9.6"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Rego: opa test + regal lint
+  # ---------------------------------------------------------------------------
+  policies:
+    name: Rego (opa test + regal lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OPA
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: ${{ env.OPA_VERSION }}
+
+      - name: Install Regal
+        uses: StyraInc/setup-regal@v1
+        with:
+          version: ${{ env.REGAL_VERSION }}
+
+      - name: Detect Rego files
+        id: detect
+        run: |
+          if find policies -type f -name '*.rego' -print -quit | grep -q .; then
+            echo "has_rego=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_rego=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No .rego files under policies/ yet — skipping opa test and regal lint."
+          fi
+
+      - name: opa test
+        if: steps.detect.outputs.has_rego == 'true'
+        run: opa test policies/ -v
+
+      - name: regal lint
+        if: steps.detect.outputs.has_rego == 'true'
+        run: regal lint policies/
+
+  # ---------------------------------------------------------------------------
+  # SPIRE config validation
+  # ---------------------------------------------------------------------------
+  spire-configs:
+    name: SPIRE config validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate SPIRE configs
+        env:
+          SPIRE_VERSION: ${{ env.SPIRE_VERSION }}
+        run: |
+          chmod +x scripts/validate-spire-configs.sh
+          ./scripts/validate-spire-configs.sh
+
+  # ---------------------------------------------------------------------------
+  # Python: type checks + pytest for services/
+  # ---------------------------------------------------------------------------
+  python:
+    name: Python (mypy + pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect Python sources under services/
+        id: detect
+        run: |
+          if find services -type f -name '*.py' -print -quit 2>/dev/null | grep -q .; then
+            echo "has_py=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_py=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No .py files under services/ yet — skipping mypy and pytest."
+          fi
+
+      - name: Set up Python
+        if: steps.detect.outputs.has_py == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python dependencies
+        if: steps.detect.outputs.has_py == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          # Install per-service requirements when present.
+          for req in $(find services -type f -name 'requirements.txt'); do
+            echo "Installing $req"
+            pip install -r "$req"
+          done
+          # Tooling.
+          pip install mypy pytest pytest-asyncio
+
+      - name: mypy
+        if: steps.detect.outputs.has_py == 'true'
+        run: |
+          mypy --install-types --non-interactive services/ || mypy services/
+
+      - name: pytest
+        if: steps.detect.outputs.has_py == 'true'
+        run: |
+          # Discover and run unit tests under services/. Integration / e2e
+          # tests live under tests/ and are run by separate workflows once
+          # they exist (Phase 3+).
+          if find services -type f -name 'test_*.py' -print -quit | grep -q .; then
+            pytest services/ -v
+          else
+            echo "::notice::No test_*.py files under services/ yet — pytest skipped."
+          fi
