@@ -1,0 +1,8 @@
+# Runtime dependencies for the test-agent reference service.
+#
+# `spiffe` is the official Python SPIFFE SDK (PyPI: spiffe). Note that the
+# legacy `py-spiffe` PyPI distribution also exists and uses the older
+# `pyspiffe` import name; the project standardizes on the newer `spiffe`
+# package. See https://pypi.org/project/spiffe/.
+spiffe>=0.2.7,<0.3
+structlog>=24.1.0,<26
