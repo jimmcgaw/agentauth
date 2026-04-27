@@ -259,3 +259,29 @@ services:
       timeout: 3s
       retries: 10
     restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # test-agent — Phase 1b reference SPIFFE workload
+  # -------------------------------------------------------------------------
+  # Minimal Python service that fetches and rotates an X.509 SVID via the
+  # Workload API. Pinned to UID 1000 to match the unix:uid:1000 selector on
+  # the registration entry created by scripts/register-test-agent.sh.
+  #
+  # Mounting the spire-agent-socket volume read-only is sufficient: a UDS
+  # client only needs traverse + read on the directory and the socket
+  # inode; it does not need write to the bind mount.
+  test-agent:
+    build:
+      context: ../services/test-agent
+      dockerfile: Dockerfile
+    image: agentauth/test-agent:dev
+    container_name: agentauth-test-agent
+    depends_on:
+      spire-agent:
+        condition: service_healthy
+    user: "1000:1000"
+    environment:
+      SPIFFE_ENDPOINT_SOCKET: unix:///run/spire/agent/sock/api.sock
+    volumes:
+      - spire-agent-socket:/run/spire/agent/sock:ro
+    restart: unless-stopped
